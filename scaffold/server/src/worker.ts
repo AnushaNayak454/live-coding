@@ -9,9 +9,9 @@ import { config } from './config.js';
 import { publishWsEvent } from './wsEvents.js';
 import { checkRateLimit, setCooloff, isCoolingOff } from './rateLimiter.js';
 
-const LOCK_TTL_MS = 60_000; // 60 seconds lock TTL
-const RETRY_DELAYS = [2000, 5000, 15000, 30000]; // retry delays in ms
-const WORKER_INTERVAL_MS = 1000;
+const LOCK_TTL_MS = 10_000; // 10 seconds lock TTL
+const RETRY_DELAYS = [1500, 2500, 4000, 8000, 15000]; // retry delays in ms
+const WORKER_INTERVAL_MS = 100;
 
 export interface OutboundJob {
   clientRef: string;
@@ -21,8 +21,8 @@ export interface OutboundJob {
   status: 'pending' | 'sending' | 'sent' | 'delivered' | 'failed';
   attempts: number;
   nextAttemptAt: Date;
-  lockedUntil?: Date;
-  lockedBy?: string;
+  lockedUntil?: Date | null;
+  lockedBy?: string | null;
   createdAt: Date;
   updatedAt: Date;
   pigeonMessageId?: string;
@@ -136,8 +136,9 @@ async function processOneJob(): Promise<boolean> {
       nextAttemptAt: { $lte: now },
       $or: [
         { lockedUntil: { $exists: false } },
+        { lockedUntil: null },
         { lockedUntil: { $lte: now } },
-      ] as any,
+      ],
     },
     {
       $set: {
@@ -173,11 +174,10 @@ async function sendJobToProvider(job: OutboundJob): Promise<void> {
       {
         $set: {
           status: 'pending',
-          lockedBy: null,
-          lockedUntil: null,
-          nextAttemptAt: new Date(Date.now() + 2000),
+          nextAttemptAt: new Date(Date.now() + 500),
           updatedAt: new Date(),
         },
+        $unset: { lockedBy: 1, lockedUntil: 1 },
       }
     );
     return;
@@ -185,18 +185,16 @@ async function sendJobToProvider(job: OutboundJob): Promise<void> {
 
   const rl = await checkRateLimit(job.workspace);
   if (!rl.allowed) {
-    const delay = (rl.retryAfter ?? 1) * 1000;
-    await setCooloff(job.workspace, rl.retryAfter ?? 1);
+    const delay = Math.max(250, rl.retryAfterMs ?? 250);
     await db.collection('outboundJobs').updateOne(
       { clientRef: job.clientRef, lockedBy: WORKER_ID },
       {
         $set: {
           status: 'pending',
-          lockedBy: null,
-          lockedUntil: null,
           nextAttemptAt: new Date(Date.now() + delay),
           updatedAt: new Date(),
         },
+        $unset: { lockedBy: 1, lockedUntil: 1 },
       }
     );
     return;
@@ -206,14 +204,17 @@ async function sendJobToProvider(job: OutboundJob): Promise<void> {
   if (!apiKey) {
     await db.collection('outboundJobs').updateOne(
       { clientRef: job.clientRef },
-      { $set: { status: 'failed', lockedBy: null, lockedUntil: null, updatedAt: new Date() } }
+      {
+        $set: { status: 'failed', updatedAt: new Date() },
+        $unset: { lockedBy: 1, lockedUntil: 1 },
+      }
     );
     return;
   }
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+    const timeout = setTimeout(() => controller.abort(), 9000); // 9s timeout
 
     let res: Response;
     try {
@@ -237,49 +238,42 @@ async function sendJobToProvider(job: OutboundJob): Promise<void> {
 
     if (res.status === 200) {
       const data = await res.json() as { id: string; status: string };
+      await updateMessageStatus(job.workspace, job.clientRef, data.id, 'sent');
       await db.collection('outboundJobs').updateOne(
-        { clientRef: job.clientRef, lockedBy: WORKER_ID },
+        { clientRef: job.clientRef },
         {
-          $set: {
-            status: 'sent',
-            pigeonMessageId: data.id,
-            lockedBy: null,
-            lockedUntil: null,
-            updatedAt: new Date(),
-          },
+          $unset: { lockedBy: 1, lockedUntil: 1 },
         }
       );
     } else if (res.status === 429) {
       // Rate limited by provider
-      const retryAfter = parseInt(res.headers.get('Retry-After') ?? '5', 10);
+      const retryAfter = parseInt(res.headers.get('Retry-After') ?? '2', 10);
       await setCooloff(job.workspace, retryAfter);
-      const delay = (retryAfter + 1) * 1000;
+      const delay = (retryAfter + 0.2) * 1000;
       await db.collection('outboundJobs').updateOne(
         { clientRef: job.clientRef, lockedBy: WORKER_ID },
         {
           $set: {
             status: 'pending',
-            lockedBy: null,
-            lockedUntil: null,
             nextAttemptAt: new Date(Date.now() + delay),
             updatedAt: new Date(),
           },
+          $unset: { lockedBy: 1, lockedUntil: 1 },
         }
       );
     } else if (res.status === 503) {
       // Temporary failure - retry with backoff
       const attempt = Math.min(job.attempts - 1, RETRY_DELAYS.length - 1);
-      const delay = RETRY_DELAYS[attempt] ?? 30000;
+      const delay = RETRY_DELAYS[attempt] ?? 15000;
       await db.collection('outboundJobs').updateOne(
         { clientRef: job.clientRef, lockedBy: WORKER_ID },
         {
           $set: {
             status: 'pending',
-            lockedBy: null,
-            lockedUntil: null,
             nextAttemptAt: new Date(Date.now() + delay),
             updatedAt: new Date(),
           },
+          $unset: { lockedBy: 1, lockedUntil: 1 },
         }
       );
     } else {
@@ -289,27 +283,25 @@ async function sendJobToProvider(job: OutboundJob): Promise<void> {
         {
           $set: {
             status: 'failed',
-            lockedBy: null,
-            lockedUntil: null,
             updatedAt: new Date(),
           },
+          $unset: { lockedBy: 1, lockedUntil: 1 },
         }
       );
     }
   } catch (err: any) {
     // Network timeout or abort - retry
     const attempt = Math.min(job.attempts - 1, RETRY_DELAYS.length - 1);
-    const delay = RETRY_DELAYS[attempt] ?? 30000;
+    const delay = RETRY_DELAYS[attempt] ?? 15000;
     await db.collection('outboundJobs').updateOne(
       { clientRef: job.clientRef },
       {
         $set: {
           status: 'pending',
-          lockedBy: null,
-          lockedUntil: null,
           nextAttemptAt: new Date(Date.now() + delay),
           updatedAt: new Date(),
         },
+        $unset: { lockedBy: 1, lockedUntil: 1 },
       }
     ).catch(() => {/* best effort */});
   }
@@ -330,11 +322,10 @@ export async function recoverAbandonedJobs(): Promise<void> {
     {
       $set: {
         status: 'pending',
-        lockedBy: null,
-        lockedUntil: null,
         nextAttemptAt: new Date(),
         updatedAt: now,
       },
+      $unset: { lockedBy: 1, lockedUntil: 1 },
     }
   );
 }
@@ -348,14 +339,14 @@ export function startWorker(): void {
   if (workerRunning) return;
   workerRunning = true;
   
-  // Recover abandoned jobs every 60 seconds
+  // Recover abandoned jobs every 3 seconds
   const recoveryInterval = setInterval(async () => {
     try {
       await recoverAbandonedJobs();
     } catch (err) {
       console.error('Recovery error:', err);
     }
-  }, 60_000);
+  }, 3_000);
   
   recoveryInterval.unref();
 
@@ -371,5 +362,5 @@ export function startWorker(): void {
     }
   }
   
-  setTimeout(loop, 100); // slight delay on startup
+  setTimeout(loop, 50); // slight delay on startup
 }

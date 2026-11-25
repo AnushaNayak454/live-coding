@@ -24,14 +24,31 @@ export async function getNextSeq(workspace: string): Promise<number> {
   return redis.incr(`seq:${workspace}`);
 }
 
-// Store event in MongoDB and publish to Redis channel
+// Store event in MongoDB and publish to Redis channel atomically
 export async function publishWsEvent(event: Omit<WsEvent, 'seq'>): Promise<WsEvent> {
   const workspace = event.workspace as string;
-  const seq = await getNextSeq(workspace);
-  const full: WsEvent = { ...event, seq, workspace, type: event.type as string };
-  
+  const redis = getRedis();
+
+  const script = `
+    local seq = redis.call('INCR', KEYS[1])
+    local data = cjson.decode(ARGV[1])
+    data['seq'] = seq
+    local payload = cjson.encode(data)
+    redis.call('PUBLISH', KEYS[2], payload)
+    return {seq, payload}
+  `;
+
+  const [seq, payload] = (await redis.eval(
+    script,
+    2,
+    `seq:${workspace}`,
+    `ws:${workspace}`,
+    JSON.stringify(event)
+  )) as [number, string];
+
+  const full: WsEvent = JSON.parse(payload);
+
   const db = await getDb();
-  // Upsert to handle race: if seq already exists, skip
   try {
     await db.collection('wsEvents').insertOne({
       ...full,
@@ -39,17 +56,12 @@ export async function publishWsEvent(event: Omit<WsEvent, 'seq'>): Promise<WsEve
     });
   } catch (err: any) {
     if (err.code === 11000) {
-      // Duplicate seq - this shouldn't happen but handle gracefully
       console.warn('Duplicate wsEvent seq, skipping:', seq);
     } else {
       throw err;
     }
   }
 
-  // Publish to Redis for cross-instance delivery
-  const redis = getRedis();
-  await redis.publish(`ws:${workspace}`, JSON.stringify(full));
-  
   return full;
 }
 

@@ -7,6 +7,7 @@ import { getRedis } from './redis.js';
 
 interface RateLimitResult {
   allowed: boolean;
+  retryAfterMs?: number;
   retryAfter?: number; // seconds to wait
 }
 
@@ -62,7 +63,7 @@ export async function checkRateLimit(workspace: string): Promise<RateLimitResult
     return { allowed: true };
   } else {
     const retryAfterMs = result[1];
-    return { allowed: false, retryAfter: Math.ceil(retryAfterMs / 1000) };
+    return { allowed: false, retryAfterMs, retryAfter: Math.ceil(retryAfterMs / 1000) };
   }
 }
 
@@ -70,11 +71,11 @@ export async function checkRateLimit(workspace: string): Promise<RateLimitResult
 export async function setCooloff(workspace: string, retryAfterSeconds: number): Promise<void> {
   const redis = getRedis();
   const key = `rl:pigeon:cooloff:${workspace}`;
-  await redis.set(key, '1', 'EX', retryAfterSeconds + 1);
+  await redis.set(key, '1', 'PX', Math.ceil((retryAfterSeconds + 0.1) * 1000));
   
   // Also drain tokens to 0 to prevent sends during cooloff
   const tokenKey = `rl:pigeon:${workspace}`;
-  await redis.hset(tokenKey, 'tokens', '0', 'last_refill', Date.now());
+  await redis.hset(tokenKey, 'tokens', '0', 'last_refill', Date.now() + Math.ceil(retryAfterSeconds * 1000));
   await redis.expire(tokenKey, retryAfterSeconds + 10);
 }
 

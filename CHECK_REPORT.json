@@ -1,0 +1,27 @@
+{
+  "profile": "full",
+  "startedAt": "2026-11-25T13:39:25.201Z",
+  "checks": [],
+  "score": 0,
+  "max": 75,
+  "levels": {
+    "1": {
+      "got": 0,
+      "max": 24
+    },
+    "2": {
+      "got": 0,
+      "max": 14
+    },
+    "3": {
+      "got": 0,
+      "max": 22
+    },
+    "5": {
+      "got": 0,
+      "max": 15
+    }
+  },
+  "error": "Port 4000 is in use. Stop your own server first: the check starts it for you.",
+  "finishedAt": "2026-11-25T13:39:25.254Z"
+}
